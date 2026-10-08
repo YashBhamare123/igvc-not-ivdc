@@ -7,6 +7,7 @@ Left-click pins a measurement, right-click clears pins.
 Keys:  q / Esc  quit        s  save snapshot (color, depth image, raw depth .npy)
        f        toggle depth filters        [ / ]  shrink / grow the max colour range
 """
+
 import os
 import time
 
@@ -38,7 +39,7 @@ def colorize(depth_m, far_m):
 def draw_colorbar(img, far_m):
     x0, y0, w, h = img.shape[1] - 30, 40, 14, img.shape[0] - 80
     ramp = np.linspace(255, 0, h).astype(np.uint8)[:, None].repeat(w, axis=1)
-    img[y0:y0 + h, x0:x0 + w] = cv2.applyColorMap(ramp, cv2.COLORMAP_TURBO)
+    img[y0 : y0 + h, x0 : x0 + w] = cv2.applyColorMap(ramp, cv2.COLORMAP_TURBO)
     cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (255, 255, 255), 1)
     for frac in (0, 0.25, 0.5, 0.75, 1):
         y = int(y0 + frac * h)
@@ -48,7 +49,7 @@ def draw_colorbar(img, far_m):
 
 def distance_at(depth_m, x, y, r=3):
     """Median of valid pixels in a small patch — far less noisy than one pixel."""
-    patch = depth_m[max(0, y - r):y + r + 1, max(0, x - r):x + r + 1]
+    patch = depth_m[max(0, y - r) : y + r + 1, max(0, x - r) : x + r + 1]
     valid = patch[patch > 0]
     return float(np.median(valid)) if valid.size else None
 
@@ -62,7 +63,7 @@ def draw_marker(img, x, y, dist, color):
 
 class Mouse:
     def __init__(self):
-        self.pos = None   # (x, y) in panel coordinates
+        self.pos = None  # (x, y) in panel coordinates
         self.pins = []
 
     def __call__(self, event, x, y, flags, _):
@@ -132,15 +133,25 @@ def main():
 
             valid = depth_m[depth_m > 0]
             header = np.full((HEADER, 2 * W, 3), 32, np.uint8)
-            stats = (f"{name}   |   {fps:4.1f} FPS   |   valid {100 * valid.size / depth_m.size:4.1f}%"
-                     + (f"   |   nearest {valid.min():.2f} m   median {np.median(valid):.2f} m"
-                        if valid.size else ""))
+            stats = (
+                f"{name}   |   {fps:4.1f} FPS   |   valid {100 * valid.size / depth_m.size:4.1f}%"
+                + (
+                    f"   |   nearest {valid.min():.2f} m   median {np.median(valid):.2f} m"
+                    if valid.size
+                    else ""
+                )
+            )
             put_text(header, stats, (12, 28), 0.6)
 
             footer = np.full((FOOTER, 2 * W, 3), 32, np.uint8)
-            put_text(footer, "hover: measure   L-click: pin   R-click: clear pins   "
-                             "[ ]: range   f: filters   s: snapshot   q: quit",
-                     (12, 19), 0.45, (190, 190, 190))
+            put_text(
+                footer,
+                "hover: measure   L-click: pin   R-click: clear pins   "
+                "[ ]: range   f: filters   s: snapshot   q: quit",
+                (12, 19),
+                0.45,
+                (190, 190, 190),
+            )
 
             cv2.imshow(WINDOW, np.vstack([header, np.hstack([color, depth_img]), footer]))
 
