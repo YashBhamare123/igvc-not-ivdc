@@ -99,6 +99,43 @@ class Vehicle:
         return self._last_cmd
 
 
+class SerialVehicle(Vehicle):
+    """Vehicle that forwards each Twist to a microcontroller over serial.
+
+    Line protocol (ASCII, newline-terminated), one line per send():
+        V <linear_m_s> <angular_rad_s>\n      e.g. "V 0.350 -0.120\n"
+    The firmware should stop the motors if no line arrives for ~0.5 s.
+    """
+
+    def __init__(
+        self,
+        port: str,
+        baud: int = 115200,
+        cfg: VehicleConfig | None = None,
+        connect_wait_s: float = 2.0,
+    ):
+        import serial  # pyserial; imported lazily so dry runs don't need it
+
+        super().__init__(cfg)
+        self.ser = serial.serial_for_url(port, baudrate=baud, timeout=0, write_timeout=0.1)
+        # Opening the port resets most Arduinos; wait for the bootloader to finish
+        time.sleep(connect_wait_s)
+        self.ser.reset_input_buffer()
+
+    def send(self, twist: Twist):
+        super().send(twist)
+        line = f"V {twist.linear_m_s:.3f} {twist.angular_rad_s:.3f}\n"
+        self.ser.write(line.encode("ascii"))
+
+    def close(self):
+        if self.ser.is_open:
+            try:
+                self.send(Twist(0.0, 0.0))
+                self.ser.flush()
+            finally:
+                self.ser.close()
+
+
 def min_edge_clearance_m(hazards) -> float:
     """Nearest physical-object edge distance (metres). inf if none."""
     if not hazards:

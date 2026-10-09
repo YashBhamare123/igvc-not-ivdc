@@ -11,3 +11,14 @@ snapshots/
 *.npy
 *.png
 .DS_Store
+stop_logs/
+
+# editor swap/backup files
+*.swp
+*.swo
+*~
+
+# Arduino build output
+build/
+*.hex
+*.elf

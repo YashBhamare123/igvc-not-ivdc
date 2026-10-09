@@ -1,4 +1,5 @@
 numpy>=1.19
 pyrealsense2>=2.50
+pyserial>=3.4
 # On x86/desktop you can also: pip install opencv-python-headless
 # On Jetson Nano prefer system OpenCV (see README): sudo apt install python3-opencv

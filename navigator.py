@@ -21,7 +21,14 @@ import math
 
 from hazard_detector import HazardConfig, stream_hazards
 from pathfinder import Pathfinder, PathfinderConfig
-from vehicle import Pose, PurePursuit, Vehicle, VehicleConfig, min_edge_clearance_m
+from vehicle import (
+    Pose,
+    PurePursuit,
+    SerialVehicle,
+    Vehicle,
+    VehicleConfig,
+    min_edge_clearance_m,
+)
 
 GOAL_AHEAD_M = 10.0
 
@@ -41,6 +48,7 @@ class Navigator:
         path_cfg: PathfinderConfig,
         goal_ahead_m: float = GOAL_AHEAD_M,
         dry_run: bool = False,
+        vehicle: Vehicle | None = None,
     ):
         if abs(hazard_cfg.safety_margin_m - vehicle_cfg.robot_radius_m) > 1e-6:
             raise ValueError(
@@ -50,7 +58,7 @@ class Navigator:
         self.hazard_cfg = hazard_cfg
         self.vehicle_cfg = vehicle_cfg
         self.pathfinder = Pathfinder(path_cfg)
-        self.vehicle = Vehicle(vehicle_cfg)
+        self.vehicle = vehicle or Vehicle(vehicle_cfg)
         self.follower = PurePursuit(vehicle_cfg)
         self.goal_ahead_m = goal_ahead_m
         self.dry_run = dry_run
@@ -136,6 +144,8 @@ class Navigator:
                     break
         finally:
             self.vehicle.stop("shutdown")
+            if isinstance(self.vehicle, SerialVehicle):
+                self.vehicle.close()
             print(
                 f"navigator stopped ({self.vehicle.stopped_reason})  "
                 f"pose x={self.vehicle.pose.x:+.2f} y={self.vehicle.pose.y:.2f} m"
@@ -175,6 +185,12 @@ def main():
         help="run perception + planning but always command zero velocity",
     )
     ap.add_argument("--headless", action="store_true")
+    ap.add_argument(
+        "--serial-port",
+        default=None,
+        help="Arduino serial port, e.g. /dev/ttyACM0 (omit: no motor output)",
+    )
+    ap.add_argument("--baud", type=int, default=115200)
     args = ap.parse_args()
 
     r = args.robot_radius_m
@@ -201,8 +217,17 @@ def main():
         cell_m=0.10,
         extra_clearance_m=0.05,
     )
+    vehicle = None
+    if args.serial_port:
+        vehicle = SerialVehicle(args.serial_port, args.baud, vehicle_cfg)
+        print(f"navigator: motor commands -> {args.serial_port} @ {args.baud}")
     Navigator(
-        hazard_cfg, vehicle_cfg, path_cfg, goal_ahead_m=args.goal_ahead_m, dry_run=args.dry_run
+        hazard_cfg,
+        vehicle_cfg,
+        path_cfg,
+        goal_ahead_m=args.goal_ahead_m,
+        dry_run=args.dry_run,
+        vehicle=vehicle,
     ).run(show=not args.headless)
 
 
