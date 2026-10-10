@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 
@@ -75,6 +76,30 @@ def fit_floor(points, rows, iters=300, tol=0.02):
     if n[1] > 0:  # camera y points down, so "up" has negative y
         n = -n
     return n, -(n @ centroid)
+
+
+def refine_floor(points, rows, normal, offset, band=0.04, max_tilt_deg=3.0, max_shift_m=0.05, max_points=3000):
+    """Re-fit the floor plane near the current one (least squares on points within `band`
+    of it). The tall camera mount pitches as the car brakes and turns, and 1 deg of tilt
+    is ~5 cm of height error 3 m out. Returns (normal, offset), or None if too little floor
+    is in view or the change is implausibly large."""
+    z = points[..., 2]
+    sel = points[(rows >= rows.max() * 0.4) & (z > 0.4) & (z < 4.0)]
+    if len(sel) < 300:
+        return None
+    pts = sel[np.abs(sel @ normal + offset) < band]
+    if len(pts) < max(300, 0.25 * len(sel)):
+        return None
+    if len(pts) > max_points:
+        pts = pts[:: len(pts) // max_points + 1]
+    centroid = pts.mean(axis=0)
+    n = np.linalg.svd(pts - centroid, full_matrices=False)[2][-1]
+    if n[1] > 0:
+        n = -n
+    off = -(n @ centroid)
+    if math.degrees(math.acos(min(1.0, float(n @ normal)))) > max_tilt_deg or abs(off - offset) > max_shift_m:
+        return None
+    return n, off
 
 
 def ground_axes(normal):

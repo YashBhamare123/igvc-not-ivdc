@@ -34,6 +34,7 @@ import stop_ahead as sa
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stop_logs")
 FEEDBACK = re.compile(r"FEEDBACK: L(-?\d+) R(-?\d+) RPM \| HALL L(-?\d+) R(-?\d+) \| IMU (.*)")
+MAX_COUNTS_PER_FB = 60  # 50 ms feedback: ~9 m/s at 7.5 mm/count, far beyond the car
 
 
 def wrap(angle):
@@ -67,7 +68,10 @@ class Car(sa.Arduino):
             time.sleep(0.02)
 
     def poll(self):
-        self._buf += self.ser.read(8192).decode("ascii", "replace")
+        # Only what's already arrived: read(n) would block for the port timeout (50 ms)
+        waiting = self.ser.in_waiting
+        if waiting:
+            self._buf += self.ser.read(waiting).decode("ascii", "replace")
         *lines, self._buf = self._buf.split("\n")
         for line in lines:
             m = FEEDBACK.match(line.strip())
@@ -88,8 +92,11 @@ class Car(sa.Arduino):
 
     def _odometry(self):
         if self._prev_hall is not None:
-            d = 0.5 * ((self.hall[0] - self._prev_hall[0]) + (self.hall[1] - self._prev_hall[1]))
-            d *= self.m_per_count
+            dl, dr = self.hall[0] - self._prev_hall[0], self.hall[1] - self._prev_hall[1]
+            # the first counts after the Arduino boots jump from 0 to the controller's running total
+            if max(abs(dl), abs(dr)) > MAX_COUNTS_PER_FB:
+                dl = dr = 0
+            d = 0.5 * (dl + dr) * self.m_per_count
             self.odo += d
             if self.yaw_ref is not None:
                 h = self.heading()  # + = turned left
@@ -106,7 +113,8 @@ class Car(sa.Arduino):
     def set_origin(self):
         """Current position and heading become (0, 0), straight ahead."""
         self.yaw_ref = self.yaw
-        self.left = self.ahead = 0.0
+        self.left = self.ahead = self.odo = 0.0
+        self._odo_hist.clear()
 
     def heading(self):
         """Radians turned since set_origin(); + = left (the BNO085 yaw is counter-clockwise)."""

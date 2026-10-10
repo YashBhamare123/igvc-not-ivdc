@@ -22,3 +22,4 @@ stop_logs/
 build/
 *.hex
 *.elf
+runs/

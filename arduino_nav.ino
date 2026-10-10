@@ -442,7 +442,7 @@ void readIMU()
 {
     if (bno08x.wasReset())
     {
-        bno08x.enableReport(SH2_ROTATION_VECTOR, 20000);
+        bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, 20000);  // game vector: gyro + accel only, no magnetometer (motor currents bent the heading)
         bno08x.enableReport(SH2_GYROSCOPE_CALIBRATED, 20000);
         bno08x.enableReport(SH2_ACCELEROMETER, 20000);
     }
@@ -450,12 +450,12 @@ void readIMU()
     if (!bno08x.getSensorEvent(&sensorValue))
         return;
 
-    if (sensorValue.sensorId == SH2_ROTATION_VECTOR)
+    if (sensorValue.sensorId == SH2_GAME_ROTATION_VECTOR)
     {
-        imu_qw = sensorValue.un.rotationVector.real;
-        imu_qx = sensorValue.un.rotationVector.i;
-        imu_qy = sensorValue.un.rotationVector.j;
-        imu_qz = sensorValue.un.rotationVector.k;
+        imu_qw = sensorValue.un.gameRotationVector.real;
+        imu_qx = sensorValue.un.gameRotationVector.i;
+        imu_qy = sensorValue.un.gameRotationVector.j;
+        imu_qz = sensorValue.un.gameRotationVector.k;
     }
     else if (sensorValue.sensorId == SH2_GYROSCOPE_CALIBRATED)
     {
@@ -540,7 +540,7 @@ void setup()
     else
     {
         Serial.println("[OK] BNO08x Found!");
-        bno08x.enableReport(SH2_ROTATION_VECTOR, 20000);
+        bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, 20000);
         bno08x.enableReport(SH2_GYROSCOPE_CALIBRATED, 20000);
         bno08x.enableReport(SH2_ACCELEROMETER, 20000);
     }
