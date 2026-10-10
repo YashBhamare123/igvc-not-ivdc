@@ -1,14 +1,15 @@
 /*
- * Arduino vehicle runner for Jetson pathfinding.
+ * Arduino vehicle runner for the Jetson course / lane stack.
  *
- * Jetson (jetson_nav.py + pathfind.py) plans the path and sends:
+ * Jetson (course.py, lane_drive.py, avoid.py, …) plans and sends:
  *   L<left> R<right>\n
  *   STOP\n
  *
  * This sketch executes those commands over CAN (Roboteq) and streams
- * FEEDBACK so the Jetson can estimate pose.
+ * FEEDBACK so the Jetson can estimate pose (hall counts + BNO085).
  *
- * Derived from main.cpp hardware bring-up (CAN, BNO085, HC-05, USB).
+ * Note: vehicle.SerialVehicle / navigator.py use a different line protocol
+ * ("V <linear> <angular>") and do not talk to this sketch.
  */
 
 #include <SPI.h>

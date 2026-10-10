@@ -1,6 +1,10 @@
 # igvc-not-ivdc
 
-Real-time hazard detection from an Intel RealSense D455, grid pathfinding around those hazards, and a local navigator that drives toward a goal **10 m ahead** of the robot.
+Two navigation stacks share a RealSense D455. They do **not** share a vehicle protocol.
+
+### A — Twist navigator (documented below)
+
+Hazard circles → grid A* → pure pursuit → `V <linear> <angular>` twists.
 
 | Module | Role |
 |--------|------|
@@ -11,6 +15,21 @@ Real-time hazard detection from an Intel RealSense D455, grid pathfinding around
 | `navigator.py` | Full loop: stream → plan → command |
 
 All distances are **metres**, speeds **m/s** / **rad/s**. Ground frame: origin under the camera, **x** right, **y** forward.
+
+### B — Arduino taped-course stack
+
+Lane tape + depth obstacles → map / planner → `L<left> R<right>` PWM via `arduino_nav.ino`.
+
+| Module | Role |
+|--------|------|
+| `stop_ahead.py` | Floor RANSAC, obstacle points, base `Arduino` serial |
+| `avoid.py` | `Car` (odometry + IMU) + simple detour demo |
+| `lane_detector.py` | Red/black tape segments |
+| `lane_drive.py` | Lane-centre steering (+ `LaneCentre` used by `course`) |
+| `course.py` | Full course: tracked map, Dijkstra, maneuvers |
+| `arduino_nav.ino` | Firmware for `L/R` / `STOP` + FEEDBACK |
+
+Bring-up order for stack B: `stop_ahead` → `avoid` → `lane_drive` → `course`.
 
 ---
 
@@ -213,9 +232,18 @@ python navigator.py --dry-run
 igvc-not-ivdc/
 ├── README.md
 ├── requirements.txt
-├── depth_viewer.py
-├── hazard_detector.py
+│
+├── depth_viewer.py          # shared camera debug
+│
+├── hazard_detector.py       # stack A
 ├── pathfinder.py
 ├── vehicle.py
-└── navigator.py
+├── navigator.py
+│
+├── stop_ahead.py            # stack B
+├── avoid.py
+├── lane_detector.py
+├── lane_drive.py
+├── course.py
+└── arduino_nav.ino
 ```

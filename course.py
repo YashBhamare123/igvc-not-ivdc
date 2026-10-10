@@ -3,21 +3,20 @@
 find a way when blocked, keep going.
 
 World map, anchored where the car starts: X metres right, Y metres ahead. The car's pose
-comes from the wheel hall counts and the BNO085 heading (avoid.Car), so everything the
-camera sees is placed on the map and remembered after it leaves the view:
+comes from the wheel hall counts and the BNO085 heading (avoid.Car). Perception is fused
+by state_tracker.StateTracker:
 
-  * Objects: obstacle points (depth, standing above the floor) are grouped into blobs
-    and matched to tracks: confirmed after --confirm sightings, smoothed as they move,
-    kept while out of view, dropped only if repeatedly not seen where they should be.
-  * Lanes: red (left) / black (right) tape builds a lane map; each lane is a wall on
-    its outer side. Not seeing a lane is fine: the car carries on in the course
-    direction (start heading, updated from the lane direction whenever tape is seen).
-  * Planning: clearance-based shortest path (car half-width + margin) on a fine grid
-    around the car, to the lane centre ahead, or else to the first reachable goal in a
-    fan around the course direction; margins are relaxed if nothing fits.
-  * Blocked (object in front, or no path): stop, then rotate in place to scan headings
-    around the course direction, look, and replan, until a way is found. Every rotation
-    is checked against the car's rectangle and the tracked objects first.
+  * Objects: depth blobs → world tracks (Hungarian match). Inside the detector frustum,
+    live evidence replaces memory (misses + free-space clears). Outside it, confirmed
+    tracks coast with a time/range TTL so stools that leave the camera still block
+    planning, without immortal side ghosts.
+  * Lanes: tape segments update world cells with the same replace / coast / TTL rules
+    and bare-floor decay; each lane is a wall on its outer side. Missing tape is fine:
+    the car keeps the course heading (start heading, updated when tape is seen).
+  * Planning: clearance-based arcs on a fine grid around the car, to the lane centre
+    ahead, or a fan around the course direction; margins relax if nothing fits.
+  * Blocked: stop, rotate to scan, replan. Rotations are checked against the car
+    rectangle and tracked objects first.
 
 Stops: no feasible path after scanning, --max-dist, --max-time, any error, Ctrl+C.
 
@@ -46,11 +45,10 @@ import avoid
 import lane_detector as ld
 import stop_ahead as sa
 from lane_drive import LaneCentre
+from state_tracker import StateTracker, config_from_args, floor_points
 from scipy import ndimage
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
-
-LANE_SIDE = {"red": "left", "black": "right"}
 
 
 # ---------------------------------------------------------------- pose / frames
@@ -77,190 +75,6 @@ class Pose:
     def world_to_cam(self, pts):
         d = np.asarray(pts, float).reshape(-1, 2) - self.cam
         return np.stack([d @ self.right, d @ self.fwd], axis=1)
-
-
-# ---------------------------------------------------------------- object tracking
-
-
-class Track:
-    _next = 1
-
-    def __init__(self, pos, radius):
-        self.id = Track._next
-        Track._next += 1
-        self.pos = np.array(pos, float)
-        self.radius = float(radius)
-        self.hits = 1
-        self.misses = 0
-
-    def __repr__(self):
-        return f"#{self.id}({self.pos[0]:+.2f},{self.pos[1]:.2f} r{self.radius:.2f})"
-
-
-class Tracker:
-    def __init__(self, args):
-        self.args = args
-        self.tracks: list[Track] = []
-
-    def detections(self, f, lat, pose):
-        """Group obstacle points (camera frame) into blobs; return [(world centre, radius)]."""
-        a = self.args
-        if f.size < a.min_points:
-            return []
-        world = pose.cam_to_world(np.stack([lat, f], axis=1))
-        cell = a.track_cell_m
-        ij = np.floor(world / cell).astype(int)
-        lo = ij.min(axis=0)
-        ij -= lo
-        grid = np.zeros((ij[:, 1].max() + 1, ij[:, 0].max() + 1), np.uint8)
-        np.add.at(grid, (ij[:, 1], ij[:, 0]), 1)
-        occ = (grid >= a.points_per_cell).astype(np.uint8)
-        occ = cv2.dilate(occ, np.ones((3, 3), np.uint8))  # join pieces of one object (legs, ring)
-        n, labels = cv2.connectedComponents(occ, connectivity=8)
-        found = []
-        lab_of_pt = labels[ij[:, 1], ij[:, 0]]
-        for k in range(1, n):
-            p = world[lab_of_pt == k]
-            if len(p) < a.min_points:
-                continue
-            c = p.mean(axis=0)
-            r = float(np.percentile(np.hypot(*(p - c).T), 98)) + cell / 2
-            found.append((c, min(max(r, a.min_object_radius), a.max_object_radius)))
-        return found
-
-    def in_view(self, pos, pose):
-        """Should the camera be seeing this spot now?"""
-        x, y = pose.world_to_cam(pos)[0]
-        return self.args.view_near < y < self.args.view_far and abs(math.degrees(math.atan2(x, y))) < self.args.view_half_angle
-
-    def update(self, dets, pose):
-        a = self.args
-        unmatched = list(range(len(dets)))
-        for t in sorted(self.tracks, key=lambda t: -t.hits):
-            best, best_d = None, None
-            for i in unmatched:
-                d = float(np.hypot(*(dets[i][0] - t.pos)))
-                if d < a.match_dist + t.radius and (best_d is None or d < best_d):
-                    best, best_d = i, d
-            if best is not None:
-                c, r = dets[best]
-                t.pos += a.track_smooth * (c - t.pos)
-                t.radius += a.track_smooth * (max(r, t.radius * 0.8) - t.radius)
-                t.hits += 1
-                t.misses = 0
-                unmatched.remove(best)
-            elif self.in_view(t.pos, pose):
-                t.misses += 1  # only count misses where we should be able to see it
-        for i in unmatched:
-            self.tracks.append(Track(*dets[i]))
-        behind = lambda t: pose.world_to_cam(t.pos)[0][1] < -a.forget_behind
-        self.tracks = [
-            t for t in self.tracks
-            if not behind(t) and t.misses < (a.drop_misses if t.hits >= a.confirm else a.drop_misses_new)
-        ]
-
-    def confirmed(self):
-        return [t for t in self.tracks if t.hits >= self.args.confirm]
-
-
-# ---------------------------------------------------------------- lane map
-
-
-class LaneMap:
-    """World cells where each lane's tape has been seen, with the tape's direction."""
-
-    def __init__(self, args):
-        self.args = args
-        self.cells = {"red": {}, "black": {}}  # (i, j) -> [count, direction]
-        self.latest = {"red": [], "black": []}  # last seen segments, world (start, end)
-        self.latest_at = {"red": None, "black": None}
-        self.start_centre = args.start_centre  # the car is placed in the lane: corridor centred on it
-
-    def add(self, lanes, pose):
-        c = self.args.lane_cell_m
-        for colour, segs in lanes.items():
-            if segs:
-                self.latest[colour] = [(pose.cam_to_world([sg.start])[0], pose.cam_to_world([sg.end])[0]) for sg in segs]
-                self.latest_at[colour] = pose.Y
-            for sg in segs:
-                n = max(2, int(sg.length / c) + 1)
-                pts = pose.cam_to_world(np.linspace(sg.start, sg.end, n))
-                d = pose.cam_to_world([sg.end])[0] - pose.cam_to_world([sg.start])[0]
-                d /= max(np.hypot(*d), 1e-6)
-                for p in pts:
-                    key = (int(p[0] // c), int(p[1] // c))
-                    cell = self.cells[colour].setdefault(key, [0, d])
-                    cell[0] += 1
-                    cell[1] = d
-
-    def walls(self, lane_width=None, near=None, radius=None):
-        """Lane wall points as an (N, 3) array [x, y, r]: each seen lane cell plus a thick wall
-        on the lane's outer side, the start corridor, and extended / mirrored lane pieces.
-        With `near`/`radius`, only points within `radius` of `near`."""
-        a, c = self.args, self.args.lane_cell_m
-        ks = np.arange(0.0, a.wall_thickness + 1e-6, a.wall_step)
-        chunks = []
-
-        def wall(P, D, colour):  # P, D: (n, 2) points and unit directions along the lane
-            if len(P) == 0:
-                return
-            out = np.stack([-D[:, 1], D[:, 0]], 1) if LANE_SIDE[colour] == "left" else np.stack([D[:, 1], -D[:, 0]], 1)
-            chunks.append((P[:, None, :] + ks[None, :, None] * out[:, None, :]).reshape(-1, 2))
-
-        for colour, cells in self.cells.items():
-            seen = [(k, d) for k, (count, d) in cells.items() if count >= a.lane_min_seen]
-            if seen:
-                P = (np.array([k for k, _ in seen], float) + 0.5) * c
-                wall(P, np.array([d for _, d in seen]), colour)
-        # The car starts in the lane, pointing along it: until the tape there is seen,
-        # assume straight lane edges half a lane width either side of the start centre
-        # (only on a side where no tape has been seen near the start, at the configured width)
-        if self.start_centre is not None and a.start_corridor > 0:
-            ys = np.arange(-0.5, a.start_corridor + 1e-6, c)
-            for colour, side in LANE_SIDE.items():
-                # the camera can't see the floor right in front of the car: wall the stretch
-                # below the nearest tape seen on this side (all of it if none seen)
-                seen = [((i + 0.5) * c, (j + 0.5) * c) for (i, j), (count, _) in self.cells[colour].items()
-                        if count >= a.lane_min_seen and -0.5 <= (j + 0.5) * c <= a.start_corridor]
-                if seen:  # straight back from the nearest tape seen
-                    x, y_end = min(seen, key=lambda p: p[1])
-                else:
-                    x = self.start_centre + (a.lane_width / 2 if side == "right" else -a.lane_width / 2)
-                    y_end = a.start_corridor
-                yy = ys[ys < y_end]
-                wall(np.stack([np.full_like(yy, x), yy], 1), np.tile([0.0, 1.0], (len(yy), 1)), colour)
-        # Tape is often hidden (stools, feet): extend the latest lane pieces both ways so the
-        # lane edge stays continuous; if one lane isn't in view, mirror the other a lane width
-        # across. Only pieces running roughly along the course: a bend extended in a straight
-        # line would wall off the lane.
-        along = lambda seg: abs(math.degrees(math.atan2(seg[1][0] - seg[0][0], seg[1][1] - seg[0][1]))) <= a.extend_max_angle
-        latest = {colour: [sg for sg in segs if along(sg)] for colour, segs in self.latest.items()}
-        if lane_width:
-            for colour, other in (("red", "black"), ("black", "red")):
-                if not latest[colour] and latest[other]:
-                    shifted = []
-                    for p0, p1 in latest[other]:
-                        d = (p1 - p0) / max(float(np.hypot(*(p1 - p0))), 1e-6)
-                        inward = np.array([d[1], -d[0]]) if LANE_SIDE[other] == "left" else np.array([-d[1], d[0]])
-                        shifted.append((p0 + lane_width * inward, p1 + lane_width * inward))
-                    latest[colour] = shifted
-        for colour, segs in latest.items():
-            synthetic = not any(along(sg) for sg in self.latest[colour])
-            for p0, p1 in segs:
-                length = float(np.hypot(*(p1 - p0)))
-                if length < 1e-3:
-                    continue
-                d = (p1 - p0) / length
-                ts = np.arange(-a.lane_extend, length + a.lane_extend + 1e-6, c)
-                if not synthetic:
-                    ts = ts[(ts < 0) | (ts > length)]  # the seen part is already in the cell walls
-                wall(p0 + ts[:, None] * d, np.tile(d, (len(ts), 1)), colour)
-        if not chunks:
-            return np.zeros((0, 3))
-        pts = np.concatenate(chunks)
-        if near is not None:
-            pts = pts[np.hypot(pts[:, 0] - near[0], pts[:, 1] - near[1]) < radius]
-        return np.column_stack([pts, np.full(len(pts), a.lane_line_r)])
 
 
 # ---------------------------------------------------------------- planning
@@ -538,22 +352,29 @@ def pursuit_point(path, pos, lookahead):
     return pts[-1]
 
 
-def debug_map(args, pose, tracker, lanemap, path, goal, scale=60, size=(480, 480)):
+def debug_map(args, pose, tracker, path, goal, scale=60, size=(480, 480)):
     W, H = size
     img = np.full((H, W, 3), 30, np.uint8)
     ox, oy = W // 2, H - 60  # car at bottom centre-ish; map scrolls with the car
     to_px = lambda P: (int(ox + (P[0] - pose.X) * scale), int(oy - (P[1] - pose.Y) * scale))
     c = args.lane_cell_m
-    for colour, cells in lanemap.cells.items():
-        col = (0, 220, 255) if colour == "red" else (255, 255, 0)  # left lane yellow, right cyan (both are black tape)
-        for (i, j), (count, _) in cells.items():
+    for colour, cells in tracker.cells.items():
+        col = (0, 220, 255) if colour == "red" else (255, 255, 0)
+        for (i, j), cell in cells.items():
+            count = cell.count if hasattr(cell, "count") else cell[0]
             if count >= args.lane_min_seen:
                 cv2.circle(img, to_px(((i + 0.5) * c, (j + 0.5) * c)), 2, col, -1)
     for t in tracker.tracks:
-        col = (0, 165, 255) if t.hits >= args.confirm else (90, 90, 90)
+        if t.status == "coasting":
+            col = (180, 100, 255)  # coasting out of view
+        elif t.hits >= args.confirm:
+            col = (0, 165, 255)
+        else:
+            col = (90, 90, 90)
         cv2.circle(img, to_px(t.pos), max(2, int(t.radius * scale)), col, 2)
         cv2.circle(img, to_px(t.pos), max(2, int((t.radius + args.half_width + args.obstacle_margin) * scale)), (60, 60, 120), 1)
-        cv2.putText(img, f"#{t.id}", to_px(t.pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        tag = f"#{t.id}" + ("~" if t.status == "coasting" else "")
+        cv2.putText(img, tag, to_px(t.pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
     if path:
         pts = [to_px(p) for p in path]
         for p, q in zip(pts, pts[1:]):
@@ -648,8 +469,10 @@ class Course:
             floor_depth_win_px=31, min_floor_depth_frac=0.5 if black_only else 0.6, min_support=25, min_length_m=0.3,
             max_gap_m=0.3, max_segments=6 if black_only else 4, inlier_m=0.03, ransac_iters=60, max_points=1500)
         # obstacle points: wide view for tracking; just-narrower-than-the-car corridor for the emergency stop
-        self.scan_args = types.SimpleNamespace(half_width=3.0, min_height=0.08, max_height=1.5,
-                                               max_range=args.obstacle_range, min_points=args.min_points)
+        self.scan_args = types.SimpleNamespace(
+            half_width=getattr(args, "view_half_width", 3.0), min_height=0.08, max_height=1.5,
+            max_range=args.obstacle_range, min_points=args.min_points,
+        )
         self.stop_args = types.SimpleNamespace(half_width=args.half_width - 0.05, min_height=0.08, max_height=1.5,
                                                max_range=3.0, min_points=args.min_points)
         self.pipe = rs.pipeline()
@@ -668,8 +491,10 @@ class Course:
         self.near = None
         self.how = "none"
         self.ack_near = None  # front distance when the last front stop was pinned in the map
-        self.bumps = []  # world spots where the front check stopped the car: kept as obstacles
         self.front_pt = None
+        self._last_pose_th = None
+        self._last_sense_t = None
+        self.yaw_rate = 0.0
 
     # --- setup / teardown
     def calibrate(self):
@@ -702,8 +527,7 @@ class Course:
         self.det_plane = (self.normal, self.offset)  # plane the lane detector's geometry was built for
         self.floor_misses = 0
         self.centre = LaneCentre(a)
-        self.tracker = Tracker(a)
-        self.lanemap = LaneMap(a)
+        self.tracker = StateTracker(config_from_args(a))
         self.cmap = ClearanceMap(a)
         self.planner = ArcPlanner(a, self.cmap)
         self.maneuvers = ManeuverPlanner(a, self.cmap)
@@ -734,21 +558,46 @@ class Course:
         f = self.align.process(self.pipe.wait_for_frames(1000))
         color = np.asanyarray(f.get_color_frame().get_data())
         depth = np.asanyarray(f.get_depth_frame().get_data()) * self.scale
+        now = time.time()
         if self.car:
             self.car.poll()
             self.pose.set(-self.car.left, self.car.ahead, self.car.heading())
+        if self._last_pose_th is not None and self._last_sense_t is not None:
+            dt = max(now - self._last_sense_t, 1e-3)
+            self.yaw_rate = avoid.wrap(self.pose.theta - self._last_pose_th) / dt
+        self._last_pose_th = self.pose.theta
+        self._last_sense_t = now
         self.n += 1
         pts = sa.to_points(depth, self.rx, self.ry)
         self.track_floor(pts)
         of, olat = sa.obstacle_points(pts, self.normal, self.offset, self.cfwd, self.cright, self.scan_args)
-        self.tracker.update(self.tracker.detections(of, olat, self.pose), self.pose)
+        ff, flat = floor_points(
+            pts, self.normal, self.offset, self.cfwd, self.cright,
+            half_width=self.scan_args.half_width, max_range=a.obstacle_range,
+        )
+        # objects first so tape-near-object filtering sees this frame's tracks
+        self.tracker.update(
+            self.pose, now, of, olat,
+            floor_f=ff, floor_lat=flat, yaw_rate=self.yaw_rate,
+            update_lanes=False,
+        )
+        red, black = self.det.masks(color, depth)
+        if a.tape == "black":
+            lanes = self.split_sides(self.drop_near_objects(self.det.segments(black, self.rng)))
+        else:
+            lanes = {"red": self.det.segments(red, self.rng), "black": self.det.segments(black, self.rng)}
+        self.tracker.update(
+            self.pose, now, lanes=lanes, yaw_rate=self.yaw_rate,
+            floor_f=ff, floor_lat=flat,
+            update_objects=False,
+        )
         self.near = sa.nearest_obstacle(pts, self.normal, self.offset, self.cfwd, self.cright, self.stop_args)
         self.front_pt = None
         if self.near is not None:  # where it is (camera frame x right, y ahead), to remember it
-            f, lat = sa.obstacle_points(pts, self.normal, self.offset, self.cfwd, self.cright, self.stop_args)
-            m = (f >= self.near) & (f < self.near + 0.15)
+            sf, slat = sa.obstacle_points(pts, self.normal, self.offset, self.cfwd, self.cright, self.stop_args)
+            m = (sf >= self.near) & (sf < self.near + 0.15)
             if m.any():
-                self.front_pt = (float(np.median(lat[m])), self.near + 0.05)
+                self.front_pt = (float(np.median(slat[m])), self.near + 0.05)
         close = self.near is not None and self.near < a.stop_dist
         if not close:
             self.ack_near = None
@@ -757,12 +606,6 @@ class Course:
         if close and self.ack_near is not None and self.near >= self.ack_near - 0.03:
             close = False
         self.hits = self.hits + 1 if close else 0
-        red, black = self.det.masks(color, depth)
-        if a.tape == "black":
-            lanes = self.split_sides(self.drop_near_objects(self.det.segments(black, self.rng)))
-        else:
-            lanes = {"red": self.det.segments(red, self.rng), "black": self.det.segments(black, self.rng)}
-        self.lanemap.add(lanes, self.pose)
         target, self.how = self.centre.update(lanes)
         self.lane_goal = self.pose.cam_to_world([target])[0] if target is not None else None
         # course direction follows lane pieces running roughly along it
@@ -846,11 +689,13 @@ class Course:
     # --- planning: lane-centre goal first, then a fan around the course direction
     def obstacles(self):
         """(tracked objects, objects + lane walls) as (N, 3) arrays [x, y, r], near the car."""
-        objs = np.array([(t.pos[0], t.pos[1], t.radius) for t in self.tracker.confirmed()] + self.bumps,
-                        float).reshape(-1, 3)
-        walls = self.lanemap.walls(lane_width=self.centre.width, near=(self.pose.X, self.pose.Y),
-                                   radius=self.args.map_half_span * 1.5)
-        return objs, np.vstack([objs, walls])
+        objs = self.tracker.obstacle_circles()
+        walls = self.tracker.walls(
+            lane_width=self.centre.width,
+            near=(self.pose.X, self.pose.Y),
+            radius=self.args.map_half_span * 1.5,
+        )
+        return objs, np.vstack([objs, walls]) if len(walls) else objs
 
     def plan(self, eager=False):
         """Pick the best short move from here (arc planner); False if none is safe."""
@@ -870,8 +715,8 @@ class Course:
     # --- motion primitives
     def remember_front(self):
         """The front check stopped the car on something the map may not hold (low parts,
-        things in the camera's near blind band): pin it in the world map for the run,
-        so the planner doesn't send the car straight back into it."""
+        things in the camera's near blind band): pin it into the state tracker with a TTL
+        so the planner steers around it without immortal ghosts."""
         if self.front_pt is None:
             return
         # Closer to the camera than the bumper means it overhangs the car (a seat): pin it
@@ -880,9 +725,8 @@ class Course:
         x, y = self.front_pt
         w = self.pose.cam_to_world([(x, max(y, bumper + self.args.bump_r + 0.02))])[0]
         self.ack_near = self.near
-        if all(math.hypot(w[0] - b[0], w[1] - b[1]) > 0.08 for b in self.bumps):
-            self.bumps.append((float(w[0]), float(w[1]), self.args.bump_r))
-            print(f"  remembered obstacle at ({w[0]:+.2f},{w[1]:.2f})")
+        t = self.tracker.remember_bump(w)
+        print(f"  remembered obstacle #{t.id} at ({w[0]:+.2f},{w[1]:.2f})")
 
     def stop(self):
         if self.car:
@@ -1177,7 +1021,7 @@ class Course:
             color, red, black, lanes = self._frame
             cam = self.det.debug_image(color, red, black, lanes)[:, : color.shape[1]]
             cv2.imwrite(os.path.join(a.save, f"t{el:05.1f}.jpg"),
-                        np.hstack([cam, debug_map(a, self.pose, self.tracker, self.lanemap, self.path, self.goal)]))
+                        np.hstack([cam, debug_map(a, self.pose, self.tracker, self.path, self.goal)]))
 
     # --- the run
     def run(self):
@@ -1354,22 +1198,29 @@ def main():
     ap.add_argument("--start-corridor", type=float, default=2.5, help="assume straight lanes this far from the start (m)")
     ap.add_argument("--extend-max-angle", type=float, default=35.0, help="only extend lane pieces this close to straight ahead (deg)")
     ap.add_argument("--lane-extend", type=float, default=1.5, help="extend seen lane pieces this far both ways (m)")
-    # object tracking
+    # object / lane state tracking (see state_tracker.py)
     ap.add_argument("--track-cell-m", type=float, default=0.05)
     ap.add_argument("--points-per-cell", type=int, default=2)
     ap.add_argument("--min-points", type=int, default=30)
     ap.add_argument("--max-object-radius", type=float, default=0.8)
-    ap.add_argument("--min-object-radius", type=float, default=0.30,
-                    help="objects are at least this big: from 1 m up the seat hides a stool's wider base (m)")
-    ap.add_argument("--match-dist", type=float, default=0.5)
-    ap.add_argument("--track-smooth", type=float, default=0.4)
-    ap.add_argument("--confirm", type=int, default=3)
-    ap.add_argument("--drop-misses", type=int, default=10, help="confirmed track: frames unseen while in view")
+    ap.add_argument("--min-object-radius", type=float, default=0.25,
+                    help="minimum object radius after clustering (m)")
+    ap.add_argument("--match-dist", type=float, default=0.55)
+    ap.add_argument("--track-smooth", type=float, default=0.45)
+    ap.add_argument("--confirm", type=int, default=3, help="sightings before a track is confirmed")
+    ap.add_argument("--drop-misses", type=int, default=8, help="confirmed: frames unseen while inside the frustum")
     ap.add_argument("--drop-misses-new", type=int, default=3)
-    ap.add_argument("--forget-behind", type=float, default=1.5, help="drop tracks this far behind the camera (m)")
-    ap.add_argument("--view-near", type=float, default=0.7)
-    ap.add_argument("--view-far", type=float, default=3.5)
-    ap.add_argument("--view-half-angle", type=float, default=25.0, help="only count a track as missed this far inside the view (deg)")
+    ap.add_argument("--coast-s", type=float, default=6.0, help="keep confirmed tracks this long after leaving the FOV (s)")
+    ap.add_argument("--coast-range", type=float, default=3.5, help="drop coasting tracks farther than this from the car (m)")
+    ap.add_argument("--bump-ttl-s", type=float, default=8.0, help="TTL for front e-stop pins (s)")
+    ap.add_argument("--free-clear-frames", type=int, default=4, help="empty-floor frames inside a track before dropping it")
+    ap.add_argument("--lane-coast-s", type=float, default=10.0, help="keep lane cells this long out of view (s)")
+    ap.add_argument("--forget-behind", type=float, default=2.0,
+                    help="drop tracks this far behind the camera only if also in the rear path corridor (m)")
+    ap.add_argument("--view-near", type=float, default=0.35, help="frustum near (must match detector)")
+    ap.add_argument("--view-far", type=float, default=4.0, help="frustum far (should match --obstacle-range)")
+    ap.add_argument("--view-half-width", type=float, default=3.0, help="frustum half-width (m); match scan corridor")
+    ap.add_argument("--view-half-angle", type=float, default=50.0, help="frustum half-angle (deg)")
     ap.add_argument("--obstacle-range", type=float, default=4.0, help="track objects up to this far (m)")
     ap.add_argument("--m-per-count", type=float, default=0.0075)
     ap.add_argument("--dry-run", action="store_true")
@@ -1377,6 +1228,7 @@ def main():
     ap.add_argument("--save", help="directory for debug images (twice a second)")
     args = ap.parse_args()
     args.lookahead = args.goal_ahead
+    args.view_far = min(args.view_far, args.obstacle_range)
     if args.save:  # keep the text log with the images
         os.makedirs(args.save, exist_ok=True)
         sys.stdout = Tee(sys.stdout, open(os.path.join(args.save, "log.txt"), "w"))
@@ -1392,7 +1244,7 @@ def main():
               f"objects tracked: {course.tracker.confirmed()}")
         if args.save:
             cv2.imwrite(os.path.join(args.save, "final_map.jpg"),
-                        debug_map(args, course.pose, course.tracker, course.lanemap, course.path, course.goal))
+                        debug_map(args, course.pose, course.tracker, course.path, course.goal))
     finally:
         course.close()
 
