@@ -165,6 +165,57 @@ For a GUI over SSH, use `ssh -X` or run on the Nano desktop.
 
 ---
 
+## Live view over WiFi (`stream.py`)
+
+`lane_follow.py` can stream what it sees and decides to another computer (e.g. a Mac) on the same network: H.264 over RTP/UDP, encoded on the Orin with GStreamer (software `x264enc`) through OpenCV. The view is a 960×720 mosaic at 15 fps:
+
+| Panel | Shows |
+|-------|-------|
+| top left | camera image, lanes in yellow, objects in red, mode and L/R command |
+| top right | depth colour map, 0–5 m |
+| bottom left | masks: lanes white, objects red |
+| bottom right | top-down: lane/object points, corridor fan, chosen corridor (green) and heading arrow |
+
+### 1. Receiver (Mac), once
+
+```bash
+brew install gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav
+ipconfig getifaddr en0      # this Mac's IP, to pass to the Orin
+```
+
+Both machines must be on the same WiFi. Allow incoming connections for `gst-launch-1.0` if macOS asks.
+
+### 2. Start the viewer (Mac)
+
+```bash
+gst-launch-1.0 udpsrc port=5000 caps="application/x-rtp,media=video,encoding-name=H264,payload=96" \
+  ! rtph264depay ! avdec_h264 ! videoconvert ! autovideosink sync=false
+```
+
+It can be started before or after the Orin side; a key frame is sent every second, so the picture appears within a second of joining.
+
+### 3. Start streaming (Orin)
+
+```bash
+sudo modprobe uvcvideo                       # after every reboot (the RealSense blacklist disables it)
+
+# motors off: perception and decisions only
+python3 lane_follow.py --dry-run --max-time 600 --stream <MAC_IP>
+
+# driving
+python3 lane_follow.py --stream <MAC_IP> --save runs/lf1
+```
+
+| Flag | Default | Notes |
+|------|---------|--------|
+| `--stream HOST` | off | receiver's IP; enables streaming |
+| `--stream-port` | `5000` | must match `udpsrc port=` on the receiver |
+| `--stream-every` | `2` | send every Nth camera frame (camera runs at 30 fps) |
+
+No picture? Check `ping <MAC_IP>` from the Orin, the macOS firewall, and that nothing else uses port 5000 on the Mac. `stream.Streamer` can be used from other scripts too: `Streamer(host).send(bgr_image)`.
+
+---
+
 ## Wiring the vehicle
 
 `Vehicle.send(twist)` defaults to **pose dead-reckoning only** (no motors). Override it before you drop `--dry-run`:

@@ -2,16 +2,17 @@
 """Basic reactive lane follower: depth camera + lane mask -> one heading vector per frame.
 
 Every frame:
-  1. top-down grid ahead of the camera: lane-mask pixels and depth points standing above
-     the floor are blocked, grown by half the car width (so the car's centre line only has
-     to stay on free cells)
-  2. rays from the camera every --ray-step degrees across +/- --ray-max: free distance =
-     how far each goes before a blocked cell
-  3. heading = the ray with the longest free distance, mildly preferring straight ahead and
-     last frame's choice. Between two lane lines the longest free ray runs along the lane,
-     so bends are followed without special cases.
-  4. drive toward it with moderate L/R differences (measured to steer correctly); sharper,
-     or nothing free close ahead: turn in place toward it.
+  1. two clean image masks: lanes (tape) and objects (depth pixels standing above the
+     floor, speckle and tiny blobs removed), projected onto the floor
+  2. candidate headings every --ray-step degrees across +/- --ray-max, each a straight
+     corridor as wide as the car plus --margin each side. Free distance = how far the
+     corridor runs before --min-points obstacle points are inside it (a stray depth pixel
+     or two doesn't block anything)
+  3. heading = the corridor with the longest free distance, mildly preferring straight
+     ahead and last frame's choice. Between two lane lines the longest corridor runs along
+     the lane, so bends are followed without special cases; objects are avoided the same way.
+  4. drive toward it with small L/R differences. Too far off, or too little free: stop and
+     search with small forward steps and small turns in place.
 No IMU, no map memory, no path planning.
 
 Usage:
@@ -35,6 +36,7 @@ import pyrealsense2 as rs
 import avoid
 import lane_detector as ld
 import stop_ahead as sa
+import stream
 
 IN = 0.0254
 
@@ -48,20 +50,9 @@ class Follower:
             per_pixel_floor=True, min_piece_m=0.4, min_thinness=4.0, under_object_m=0.35, tall_m=0.25,
             glare_l=225, black_max_ratio=0.62, floor_depth_win_px=31, min_floor_depth_frac=0.5, min_support=25,
             min_length_m=0.3, max_gap_m=0.3, max_segments=6, inlier_m=0.03, ransac_iters=60, max_points=1500)
-        c = a.cell
-        self.nx, self.ny = int(2 * a.grid_half_width / c), int(a.grid_ahead / c)
-        # rays: cell indices along each heading, from the camera outward
-        self.angles = np.arange(-a.ray_max, a.ray_max + 1e-6, a.ray_step)
-        s = np.arange(0.0, a.grid_ahead, c / 2)
-        self.ray_s = s
-        self.ray_i, self.ray_j = [], []
-        for ang in np.radians(self.angles):
-            x, y = s * math.sin(ang), s * math.cos(ang)  # + angle = right
-            self.ray_i.append(((x + a.grid_half_width) / c).astype(int))
-            self.ray_j.append((y / c).astype(int))
-        self.ray_i, self.ray_j = np.array(self.ray_i), np.array(self.ray_j)
-        r = int(round((a.width / 2 + a.margin) / c))
-        self.grow = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+        self.angles = np.arange(-a.ray_max, a.ray_max + 1e-6, a.ray_step)  # + = right
+        self.sin, self.cos = np.sin(np.radians(self.angles)), np.cos(np.radians(self.angles))
+        self.half = a.width / 2 + a.margin  # corridor half width
         self.prev = 0.0
         self.smooth = 0.0  # heading actually steered toward (deg, + = right)
         self.mode, self.until, self.commit, self.move_hall = "drive", 0.0, 0, None
@@ -71,6 +62,7 @@ class Follower:
         self.n = 0
         self.last_print = self.last_save = -1
         self.moves = []
+        self.streamer = stream.Streamer(a.stream, a.stream_port) if a.stream else None
 
     # --- setup
     def start(self):
@@ -101,11 +93,13 @@ class Follower:
             os.makedirs(os.path.join(a.save, "masks"), exist_ok=True)
 
     def close(self):
+        if self.streamer:
+            self.streamer.close()
         if self.car:
             self.car.close()
         self.pipe.stop()
 
-    # --- one frame: grid, rays, heading
+    # --- one frame: obstacle points, corridors, heading
     def sense(self):
         a = self.a
         f = self.align.process(self.pipe.wait_for_frames(1000))
@@ -122,33 +116,49 @@ class Follower:
         # objects: depth points standing on the floor (threshold grows with depth noise)
         h = pts @ self.normal + self.offset
         y, x = pts @ fwd, pts @ right
-        obj = (pts[..., 2] > 0) & (h > a.min_height + 0.006 * pts[..., 2] ** 2) & (h < a.max_height) & (y > 0.1) & (y < a.grid_ahead)
+        raw = (pts[..., 2] > 0) & (h > a.min_height + 0.006 * pts[..., 2] ** 2) & (h < a.max_height) & (y > 0.1) & (y < a.look_ahead)
+        obj = self.object_mask(raw, pts[..., 2])
+        self.obj_mask = obj  # at the depth point stride
         # lanes: tape pixels projected onto the floor
         _, self.lane_mask = self.det.masks(self.color, self.depth)
-        lx, ly = self.det.gx[self.lane_mask], self.det.gy[self.lane_mask]  # relative to the floor point below the camera
-        # grid (camera frame: x right, y ahead)
-        c = a.cell
-        grid = np.zeros((self.ny, self.nx), np.uint8)
-        for gx, gy in ((x[obj], y[obj]), (lx, ly)):
-            i = ((gx + a.grid_half_width) / c).astype(int)
-            j = (gy / c).astype(int)
-            ok = (i >= 0) & (i < self.nx) & (j >= 0) & (j < self.ny)
-            grid[j[ok], i[ok]] = 1
-        self.raw_grid = grid
-        self.blocked = cv2.dilate(grid, self.grow).astype(bool)
-        # rays
-        ok = (self.ray_i >= 0) & (self.ray_i < self.nx) & (self.ray_j >= 0) & (self.ray_j < self.ny)
-        hit = np.zeros(self.ray_i.shape, bool)
-        hit[ok] = self.blocked[self.ray_j[ok], self.ray_i[ok]]
-        hit[~ok] = True  # off the grid's sides: treat as blocked
-        hit[:, self.ray_s < a.ignore_near] = False  # the cell the car is in (and the blind band below the camera)
-        first = np.where(hit.any(axis=1), hit.argmax(axis=1), hit.shape[1])
-        self.free = self.ray_s[np.minimum(first, len(self.ray_s) - 1)]
-        self.free[~hit.any(axis=1)] = a.grid_ahead
+        lane = self.lane_mask[::sa.STRIDE, ::sa.STRIDE]  # same density as the depth points
+        gx, gy = self.det.gx[::sa.STRIDE, ::sa.STRIDE], self.det.gy[::sa.STRIDE, ::sa.STRIDE]
+        # obstacle points on the floor (x right, y ahead of the camera)
+        self.obj_xy = (x[obj], y[obj])
+        self.lane_xy = (gx[lane], gy[lane])
+        self.free = self.corridors(np.concatenate([x[obj], gx[lane]]), np.concatenate([y[obj], gy[lane]]))
         score = np.minimum(self.free, a.free_cap) - a.w_straight * np.abs(self.angles) / 45 - a.w_keep * np.abs(self.angles - self.prev) / 45
         best = int(np.argmax(score))
         self.heading, self.best_free = float(self.angles[best]), float(self.free[best])
         self.prev = self.heading
+
+    def object_mask(self, raw, z):
+        """Clean object mask, the way the lane mask is cleaned: drop speckle, then drop blobs
+        smaller than --min-object-m across (size from pixel area and the blob's depth)."""
+        a = self.a
+        m = cv2.morphologyEx(raw.astype(np.uint8), cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+        if n <= 1:
+            return m.astype(bool)
+        zsum = np.bincount(labels.ravel(), weights=np.where(m > 0, z, 0).ravel(), minlength=n)
+        area = stats[:, cv2.CC_STAT_AREA]
+        across = np.sqrt(area) * sa.STRIDE * (zsum / np.maximum(area, 1)) / self.intr.fx  # metres
+        keep = across >= a.min_object_m
+        keep[0] = False  # background
+        return keep[labels]
+
+    def corridors(self, x, y):
+        """Free distance along each heading's car-wide corridor (m)."""
+        a = self.a
+        free = np.full(len(self.angles), a.look_ahead)
+        if len(x) < a.min_points:
+            return free
+        along = np.outer(self.sin, x) + np.outer(self.cos, y)  # headings x points
+        side = np.abs(np.outer(self.cos, x) - np.outer(self.sin, y))
+        inside = (side < self.half) & (along > a.ignore_near) & (along < a.look_ahead)
+        along = np.where(inside, along, np.inf)
+        kth = np.partition(along, a.min_points - 1, axis=1)[:, a.min_points - 1]
+        return np.minimum(free, kth)
 
     # --- motors
     def command(self):
@@ -230,6 +240,24 @@ class Follower:
                     continue
                 self.car.drive(*cmd)
             self.log(cmd, el)
+            if self.streamer and self.n % a.stream_every == 0:
+                self.streamer.send(self.view(cmd))
+
+    def view(self, cmd):
+        """2x2 live view: camera + detections, depth, lane mask, top-down corridors with the heading."""
+        cam = self.overlay()
+        objs = self.full_obj_mask().astype(bool)
+        cam[objs] = (0.5 * cam[objs] + 0.5 * np.array([0, 0, 255])).astype(np.uint8)
+        depth = cv2.applyColorMap(cv2.convertScaleAbs(self.depth, alpha=255 / 5.0), cv2.COLORMAP_JET)
+        depth[self.depth == 0] = 0
+        mask = cv2.cvtColor(self.lane_mask.astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
+        mask[objs] = (0, 0, 255)
+        state = f"{self.mode} L{cmd[0]:.0f} R{cmd[1]:.0f}" if self.car else "motors off"
+        return stream.grid([(cam, f"camera: lanes yellow, objects red | {state}"), (depth, "depth (0-5 m)"),
+                            (mask, "masks: lanes white, objects red"), (self.topdown(), f"top-down: heading {self.heading:+.0f} deg, free {self.best_free:.1f} m")])
+
+    def full_obj_mask(self):
+        return cv2.resize(self.obj_mask.astype(np.uint8), self.color.shape[1::-1], interpolation=cv2.INTER_NEAREST)
 
     def stop(self):
         if self.car:
@@ -248,6 +276,7 @@ class Follower:
             self.last_save = int(el * 2)
             cv2.imwrite(os.path.join(a.save, f"t{el:05.1f}.jpg"), np.hstack([self.overlay(), self.topdown()]))
             cv2.imwrite(os.path.join(a.save, "masks", f"t{el:05.1f}_lane_mask.png"), self.lane_mask.astype(np.uint8) * 255)
+            cv2.imwrite(os.path.join(a.save, "masks", f"t{el:05.1f}_object_mask.png"), self.full_obj_mask() * 255)
 
     def overlay(self):
         img = self.color.copy()
@@ -257,25 +286,23 @@ class Follower:
 
     def topdown(self, size=480):
         a = self.a
-        px = size / max(2 * a.grid_half_width, a.grid_ahead)
+        px = (size - 20) / a.look_ahead
         img = np.full((size, size, 3), 30, np.uint8)
         to = lambda x, y: (int(size / 2 + x * px), int(size - 10 - y * px))
-        blk = cv2.resize(self.blocked[::-1].astype(np.uint8) * 80, (int(self.nx * a.cell * px), int(self.ny * a.cell * px)), interpolation=cv2.INTER_NEAREST)
-        raw = cv2.resize(self.raw_grid[::-1] * 255, blk.shape[::-1], interpolation=cv2.INTER_NEAREST)
-        x0, y0 = to(-a.grid_half_width, a.grid_ahead)
-        h_, w_ = blk.shape
-        y1, x1 = min(size, y0 + h_), min(size, x0 + w_)
-        roi = img[max(0, y0):y1, max(0, x0):x1]
-        b = blk[: roi.shape[0], : roi.shape[1]]; r = raw[: roi.shape[0], : roi.shape[1]]
-        roi[b > 0] = (60, 60, 120)
-        roi[r > 0] = (0, 200, 255)
-        for ang, fr in zip(self.angles, self.free):
-            t = math.radians(ang)
-            cv2.line(img, to(0, 0), to(fr * math.sin(t), fr * math.cos(t)), (90, 90, 90), 1)
+        # chosen corridor
         t = math.radians(self.heading)
-        cv2.arrowedLine(img, to(0, 0), to(self.best_free * math.sin(t), self.best_free * math.cos(t)), (0, 255, 0), 3, tipLength=0.08)
+        d, n = np.array([math.sin(t), math.cos(t)]), np.array([math.cos(t), -math.sin(t)])
+        poly = [to(*(e * d + k * self.half * n)) for e, k in ((0, -1), (self.best_free, -1), (self.best_free, 1), (0, 1))]
+        cv2.fillPoly(img, [np.array(poly)], (40, 80, 40))
+        for ang, fr in zip(self.angles, self.free):
+            r = math.radians(ang)
+            cv2.line(img, to(0, 0), to(fr * math.sin(r), fr * math.cos(r)), (90, 90, 90), 1)
+        for (xs, ys), colour in ((self.lane_xy, (0, 255, 255)), (self.obj_xy, (0, 0, 255))):
+            u, v = (size / 2 + xs * px).astype(int), (size - 10 - ys * px).astype(int)
+            ok = (u >= 0) & (u < size) & (v >= 0) & (v < size)
+            img[v[ok], u[ok]] = colour
+        cv2.arrowedLine(img, to(0, 0), to(*(self.best_free * d)), (0, 255, 0), 3, tipLength=0.08)
         return img
-
 
 class Tee:
     def __init__(self, *streams):
@@ -297,15 +324,15 @@ def main():
     ap.add_argument("--width", type=float, default=32 * IN)
     ap.add_argument("--margin", type=float, default=0.03, help="extra clearance each side (m)")
     ap.add_argument("--m-per-count", type=float, default=0.0075)
-    # grid / rays
-    ap.add_argument("--cell", type=float, default=0.04)
-    ap.add_argument("--grid-half-width", type=float, default=2.0)
-    ap.add_argument("--grid-ahead", type=float, default=3.0)
+    # corridors
+    ap.add_argument("--look-ahead", type=float, default=3.0, help="ignore anything further than this (m)")
+    ap.add_argument("--min-points", type=int, default=3, help="obstacle points inside a corridor before it counts as blocked")
     ap.add_argument("--min-height", type=float, default=0.08)
+    ap.add_argument("--min-object-m", type=float, default=0.05, help="object blobs smaller than this across are noise (m)")
     ap.add_argument("--max-height", type=float, default=1.3)
     ap.add_argument("--ray-step", type=float, default=4.0)
     ap.add_argument("--ray-max", type=float, default=32.0)
-    ap.add_argument("--ignore-near", type=float, default=0.3, help="rays start counting this far from the camera (m)")
+    ap.add_argument("--ignore-near", type=float, default=0.3, help="corridors start this far from the camera (m)")
     ap.add_argument("--free-cap", type=float, default=2.5, help="free distance beyond this is all equally good (m)")
     ap.add_argument("--w-straight", type=float, default=0.3, help="preference for straight ahead (m per 45 deg)")
     ap.add_argument("--w-keep", type=float, default=0.3, help="preference for last frame's heading (m per 45 deg)")
@@ -332,6 +359,9 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--frames", type=int, default=0)
     ap.add_argument("--save")
+    ap.add_argument("--stream", metavar="HOST", help="stream a live view (H.264 over RTP/UDP) to this machine")
+    ap.add_argument("--stream-port", type=int, default=5000)
+    ap.add_argument("--stream-every", type=int, default=2, help="send every Nth frame (camera runs at 30)")
     a = ap.parse_args()
     if a.save:
         os.makedirs(a.save, exist_ok=True)
