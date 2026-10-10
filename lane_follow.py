@@ -5,7 +5,7 @@ Every frame:
   1. two clean image masks: lanes (tape) and objects (depth pixels standing above the
      floor, speckle and tiny blobs removed), projected onto the floor
   2. candidate headings every --ray-step degrees across +/- --ray-max, each a straight
-     corridor as wide as the car plus --margin each side. Free distance = how far the
+     corridor as wide as the car plus --margin each side (--object-margin for objects). Free distance = how far the
      corridor runs before --min-points obstacle points are inside it (a stray depth pixel
      or two doesn't block anything)
   3. heading = the corridor with the longest free distance, mildly preferring straight
@@ -52,7 +52,9 @@ class Follower:
             min_length_m=0.3, max_gap_m=0.3, max_segments=6, inlier_m=0.03, ransac_iters=60, max_points=1500)
         self.angles = np.arange(-a.ray_max, a.ray_max + 1e-6, a.ray_step)  # + = right
         self.sin, self.cos = np.sin(np.radians(self.angles)), np.cos(np.radians(self.angles))
-        self.half = a.width / 2 + a.margin  # corridor half width
+        self.half = a.width / 2 + a.margin  # corridor half width for lane points
+        self.half_obj = a.width / 2 + a.object_margin  # ...and for object points: keep well clear
+        self.lane_counts, self.held = [], 0
         self.prev = 0.0
         self.smooth = 0.0  # heading actually steered toward (deg, + = right)
         self.mode, self.until, self.commit, self.move_hall = "drive", 0.0, 0, None
@@ -120,13 +122,16 @@ class Follower:
         obj = self.object_mask(raw, pts[..., 2])
         self.obj_mask = obj  # at the depth point stride
         # lanes: tape pixels projected onto the floor
-        _, self.lane_mask = self.det.masks(self.color, self.depth)
+        _, lane_mask = self.det.masks(self.color, self.depth)
+        lane_mask = self.steady(lane_mask)
+        self.bridge_mask = self.bridges(lane_mask)
+        self.lane_mask = lane_mask | self.bridge_mask
         lane = self.lane_mask[::sa.STRIDE, ::sa.STRIDE]  # same density as the depth points
         gx, gy = self.det.gx[::sa.STRIDE, ::sa.STRIDE], self.det.gy[::sa.STRIDE, ::sa.STRIDE]
         # obstacle points on the floor (x right, y ahead of the camera)
         self.obj_xy = (x[obj], y[obj])
         self.lane_xy = (gx[lane], gy[lane])
-        self.free = self.corridors(np.concatenate([x[obj], gx[lane]]), np.concatenate([y[obj], gy[lane]]))
+        self.free = np.minimum(self.corridors(x[obj], y[obj], self.half_obj), self.corridors(gx[lane], gy[lane], self.half))
         score = np.minimum(self.free, a.free_cap) - a.w_straight * np.abs(self.angles) / 45 - a.w_keep * np.abs(self.angles - self.prev) / 45
         best = int(np.argmax(score))
         self.heading, self.best_free = float(self.angles[best]), float(self.free[best])
@@ -147,7 +152,74 @@ class Follower:
         keep[0] = False  # background
         return keep[labels]
 
-    def corridors(self, x, y):
+    def steady(self, mask):
+        """Lane mask flicker guard: a mask that suddenly falls below 30% of its recent size
+        is replaced by the last good one, for at most --lane-hold frames (then it's believed:
+        the tape really left the view). The raw frame is saved to <save>/drops/ for diagnosis."""
+        a = self.a
+        n = int(mask.sum())
+        recent = np.median(self.lane_counts) if len(self.lane_counts) >= 5 else 0
+        if recent > 500 and n < 0.3 * recent and self.held < a.lane_hold:
+            self.held += 1
+            print(f"  lane mask dropped to {n} px (recent {recent:.0f}): holding the last one ({self.held}/{a.lane_hold})")
+            if a.save:
+                os.makedirs(os.path.join(a.save, "drops"), exist_ok=True)
+                base = os.path.join(a.save, "drops", f"f{self.n:05d}")
+                cv2.imwrite(base + "_color.png", self.color)
+                np.save(base + "_depth.npy", (self.depth * 1000).astype(np.uint16))
+            return self.good_mask
+        self.held = 0
+        self.good_mask = mask
+        self.lane_counts = (self.lane_counts + [n])[-10:]
+        return mask
+
+    def bridges(self, mask):
+        """Join tape pieces across clear gaps: two piece ends that point at each other (within
+        --bridge-deg) and are at most --bridge-m apart on the floor get a line drawn between
+        them. Redone every frame, so real tape replaces a bridge as soon as it's seen."""
+        a = self.a
+        out = np.zeros(mask.shape, np.uint8)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+        ends = []  # (pixel (u, v), floor point, outward unit direction, piece)
+        for k in range(1, n):
+            if stats[k, cv2.CC_STAT_AREA] < 30:
+                continue
+            vs, us = np.nonzero(labels == k)
+            fl = np.stack([self.det.gx[vs, us], self.det.gy[vs, us]], axis=1)
+            ok = np.isfinite(fl).all(axis=1)
+            vs, us, fl = vs[ok], us[ok], fl[ok]
+            if len(fl) < 30:
+                continue
+            c = fl - fl.mean(axis=0)
+            axis = np.linalg.svd(c, full_matrices=False)[2][0]
+            t = c @ axis
+            for i in (int(np.argmin(t)), int(np.argmax(t))):
+                near = fl[np.linalg.norm(fl - fl[i], axis=1) < 0.3]  # the piece's last 30 cm
+                d = fl[i] - near.mean(axis=0)
+                if np.linalg.norm(d) < 0.03:
+                    continue
+                ends.append(((int(us[i]), int(vs[i])), fl[i], d / np.linalg.norm(d), k))
+        cos = math.cos(math.radians(a.bridge_deg))
+        pairs = []
+        for i in range(len(ends)):
+            for j in range(i + 1, len(ends)):
+                (pi, fi, di, ki), (pj, fj, dj, kj) = ends[i], ends[j]
+                gap = fj - fi
+                dist = float(np.linalg.norm(gap))
+                if ki == kj or dist > a.bridge_m or dist < 1e-3:
+                    continue
+                g = gap / dist
+                if di @ g > cos and dj @ -g > cos:
+                    pairs.append((dist, i, j))
+        used = set()
+        for dist, i, j in sorted(pairs):
+            if i in used or j in used:
+                continue
+            used |= {i, j}
+            cv2.line(out, ends[i][0], ends[j][0], 1, 6)
+        return out.astype(bool) & ~mask
+
+    def corridors(self, x, y, half):
         """Free distance along each heading's car-wide corridor (m)."""
         a = self.a
         free = np.full(len(self.angles), a.look_ahead)
@@ -155,7 +227,7 @@ class Follower:
             return free
         along = np.outer(self.sin, x) + np.outer(self.cos, y)  # headings x points
         side = np.abs(np.outer(self.cos, x) - np.outer(self.sin, y))
-        inside = (side < self.half) & (along > a.ignore_near) & (along < a.look_ahead)
+        inside = (side < half) & (along > a.ignore_near) & (along < a.look_ahead)
         along = np.where(inside, along, np.inf)
         kth = np.partition(along, a.min_points - 1, axis=1)[:, a.min_points - 1]
         return np.minimum(free, kth)
@@ -251,10 +323,11 @@ class Follower:
         depth = cv2.applyColorMap(cv2.convertScaleAbs(self.depth, alpha=255 / 5.0), cv2.COLORMAP_JET)
         depth[self.depth == 0] = 0
         mask = cv2.cvtColor(self.lane_mask.astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
+        mask[self.bridge_mask] = (0, 140, 255)
         mask[objs] = (0, 0, 255)
         state = f"{self.mode} L{cmd[0]:.0f} R{cmd[1]:.0f}" if self.car else "motors off"
-        return stream.grid([(cam, f"camera: lanes yellow, objects red | {state}"), (depth, "depth (0-5 m)"),
-                            (mask, "masks: lanes white, objects red"), (self.topdown(), f"top-down: heading {self.heading:+.0f} deg, free {self.best_free:.1f} m")])
+        return stream.grid([(cam, f"camera: lanes yellow/orange, objects red | {state}"), (depth, "depth (0-5 m)"),
+                            (mask, "masks: lanes white, bridged gaps orange, objects red"), (self.topdown(), f"top-down: heading {self.heading:+.0f} deg, free {self.best_free:.1f} m")])
 
     def full_obj_mask(self):
         return cv2.resize(self.obj_mask.astype(np.uint8), self.color.shape[1::-1], interpolation=cv2.INTER_NEAREST)
@@ -281,6 +354,7 @@ class Follower:
     def overlay(self):
         img = self.color.copy()
         img[self.lane_mask] = (0, 255, 255)
+        img[self.bridge_mask] = (0, 140, 255)  # bridged gaps
         cv2.putText(img, f"heading {self.heading:+.0f} deg, free {self.best_free:.2f} m", (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         return img
 
@@ -322,7 +396,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", default="/dev/ttyACM0")
     ap.add_argument("--width", type=float, default=32 * IN)
-    ap.add_argument("--margin", type=float, default=0.03, help="extra clearance each side (m)")
+    ap.add_argument("--margin", type=float, default=0.03, help="extra clearance each side from lane tape (m)")
+    ap.add_argument("--object-margin", type=float, default=0.25, help="extra clearance each side from objects (m)")
+    ap.add_argument("--bridge-m", type=float, default=1.0, help="join tape pieces across gaps up to this long (m)")
+    ap.add_argument("--bridge-deg", type=float, default=35.0, help="...if their ends point at each other within this angle")
+    ap.add_argument("--lane-hold", type=int, default=3, help="frames to keep the last lane mask when it suddenly drops out")
     ap.add_argument("--m-per-count", type=float, default=0.0075)
     # corridors
     ap.add_argument("--look-ahead", type=float, default=3.0, help="ignore anything further than this (m)")

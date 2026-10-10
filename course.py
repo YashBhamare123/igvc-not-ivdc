@@ -8,7 +8,9 @@ camera sees is placed on the map and remembered after it leaves the view:
 
   * Objects: obstacle points (depth, standing above the floor) are grouped into blobs
     and matched to tracks: confirmed after --confirm sightings, smoothed as they move,
-    kept while out of view, dropped only if repeatedly not seen where they should be.
+    kept while out of view (FOV sides, front blind band) until the camera sees them
+    again; dropped if repeatedly missing where they should be visible, if they pass
+    beside/under the car, fall too far behind, or exceed --memory-s without a re-sight.
   * Lanes: red (left) / black (right) tape builds a lane map; each lane is a wall on
     its outer side. Not seeing a lane is fine: the car carries on in the course
     direction (start heading, updated from the lane direction whenever tape is seen).
@@ -85,19 +87,28 @@ class Pose:
 class Track:
     _next = 1
 
-    def __init__(self, pos, radius):
+    def __init__(self, pos, radius, now=None):
         self.id = Track._next
         Track._next += 1
         self.pos = np.array(pos, float)
         self.radius = float(radius)
         self.hits = 1
         self.misses = 0
+        self.last_seen = time.time() if now is None else now
 
     def __repr__(self):
         return f"#{self.id}({self.pos[0]:+.2f},{self.pos[1]:.2f} r{self.radius:.2f})"
 
 
 class Tracker:
+    """Persistent object tracks in the world frame.
+
+    Matched detections update a track. Unmatched tracks stay when they leave the camera
+    view (FOV edge or front blind band) until they are seen again; they are dropped only
+    when missing inside the view cone, when they pass beside/under the car, when they fall
+    behind, or when --memory-s elapses without a re-sight.
+    """
+
     def __init__(self, args):
         self.args = args
         self.tracks: list[Track] = []
@@ -129,12 +140,38 @@ class Tracker:
         return found
 
     def in_view(self, pos, pose):
-        """Should the camera be seeing this spot now?"""
-        x, y = pose.world_to_cam(pos)[0]
-        return self.args.view_near < y < self.args.view_far and abs(math.degrees(math.atan2(x, y))) < self.args.view_half_angle
-
-    def update(self, dets, pose):
+        """Floor spot the depth camera should be seeing now (miss-count region)."""
         a = self.args
+        x, y = pose.world_to_cam(pos)[0]
+        if not (a.view_near < y < a.view_far):
+            return False
+        return abs(math.degrees(math.atan2(x, y))) < a.view_half_angle
+
+    def beside_car(self, pos, pose):
+        """Next to the car body on either side (not the front blind band, not far-off FOV).
+
+        Used to expire lateral near-band ghosts that are neither in the miss-count cone nor
+        far enough behind to hit --forget-behind. True out-of-view objects farther away are
+        left alone until re-seen or --memory-s.
+        """
+        a = self.args
+        d = np.asarray(pos, float) - [pose.X, pose.Y]
+        xc, yc = float(d @ pose.right), float(d @ pose.fwd)
+        side = a.half_width + a.beside_clear
+        return side < abs(xc) < side + a.beside_band and abs(yc) < a.half_length + a.beside_along
+
+    def overlaps_car(self, t, pose):
+        """Object disk overlaps the car's rectangle enough that it isn't there any more
+        (passed under / beside, or a person who walked away)."""
+        a = self.args
+        d = t.pos - np.array([pose.X, pose.Y])
+        xc, yc = float(d @ pose.right), float(d @ pose.fwd)
+        clear = max(abs(xc) - a.half_width, 0.0) ** 2 + max(abs(yc) - a.half_length, 0.0) ** 2
+        return clear < max(t.radius - a.overlap_ok, 0.0) ** 2
+
+    def update(self, dets, pose, now=None):
+        a = self.args
+        now = time.time() if now is None else now
         unmatched = list(range(len(dets)))
         for t in sorted(self.tracks, key=lambda t: -t.hits):
             best, best_d = None, None
@@ -148,16 +185,33 @@ class Tracker:
                 t.radius += a.track_smooth * (max(r, t.radius * 0.8) - t.radius)
                 t.hits += 1
                 t.misses = 0
+                t.last_seen = now
                 unmatched.remove(best)
             elif self.in_view(t.pos, pose):
-                t.misses += 1  # only count misses where we should be able to see it
+                t.misses += 1  # should be visible: count toward drop
+            elif self.beside_car(t.pos, pose):
+                # lateral near-band ghosts used to live forever (not in_view, not behind);
+                # expire them on the same miss budget as an in-view miss
+                t.misses += 1
+            # else: true out-of-view / front blind band — keep until re-seen or aged out
         for i in unmatched:
-            self.tracks.append(Track(*dets[i]))
-        behind = lambda t: pose.world_to_cam(t.pos)[0][1] < -a.forget_behind
-        self.tracks = [
-            t for t in self.tracks
-            if not behind(t) and t.misses < (a.drop_misses if t.hits >= a.confirm else a.drop_misses_new)
-        ]
+            self.tracks.append(Track(*dets[i], now=now))
+
+        kept = []
+        for t in self.tracks:
+            if self.overlaps_car(t, pose):
+                continue
+            y = float(pose.world_to_cam(t.pos)[0][1])
+            if y < -a.forget_behind:
+                continue
+            miss_lim = a.drop_misses if t.hits >= a.confirm else a.drop_misses_new
+            if t.misses >= miss_lim:
+                continue
+            max_age = a.memory_s if t.hits >= a.confirm else a.memory_s_new
+            if now - t.last_seen > max_age:
+                continue
+            kept.append(t)
+        self.tracks = kept
 
     def confirmed(self):
         return [t for t in self.tracks if t.hits >= self.args.confirm]
@@ -549,8 +603,13 @@ def debug_map(args, pose, tracker, lanemap, path, goal, scale=60, size=(480, 480
         for (i, j), (count, _) in cells.items():
             if count >= args.lane_min_seen:
                 cv2.circle(img, to_px(((i + 0.5) * c, (j + 0.5) * c)), 2, col, -1)
+    now = time.time()
     for t in tracker.tracks:
-        col = (0, 165, 255) if t.hits >= args.confirm else (90, 90, 90)
+        fresh = now - t.last_seen < 0.4
+        if t.hits >= args.confirm:
+            col = (0, 165, 255) if fresh else (200, 200, 80)  # orange = seen now; muted = held out of view
+        else:
+            col = (90, 90, 90)
         cv2.circle(img, to_px(t.pos), max(2, int(t.radius * scale)), col, 2)
         cv2.circle(img, to_px(t.pos), max(2, int((t.radius + args.half_width + args.obstacle_margin) * scale)), (60, 60, 120), 1)
         cv2.putText(img, f"#{t.id}", to_px(t.pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
@@ -1364,12 +1423,25 @@ def main():
     ap.add_argument("--match-dist", type=float, default=0.5)
     ap.add_argument("--track-smooth", type=float, default=0.4)
     ap.add_argument("--confirm", type=int, default=3)
-    ap.add_argument("--drop-misses", type=int, default=10, help="confirmed track: frames unseen while in view")
+    ap.add_argument("--drop-misses", type=int, default=10, help="confirmed track: frames unseen while in view (or beside the car)")
     ap.add_argument("--drop-misses-new", type=int, default=3)
     ap.add_argument("--forget-behind", type=float, default=1.5, help="drop tracks this far behind the camera (m)")
+    ap.add_argument("--beside-clear", type=float, default=0.15,
+                    help="outside the car half-width by this much starts the beside-expire band (m)")
+    ap.add_argument("--beside-band", type=float, default=1.5,
+                    help="width of the beside-expire band beyond --beside-clear (m)")
+    ap.add_argument("--beside-along", type=float, default=0.5,
+                    help="beside-expire band extends this far past the car half-length (m)")
+    ap.add_argument("--overlap-ok", type=float, default=0.05,
+                    help="drop a track whose disk overlaps the car rectangle more than this (m)")
+    ap.add_argument("--memory-s", type=float, default=20.0,
+                    help="confirmed track: max time held out of view without a re-sight (s)")
+    ap.add_argument("--memory-s-new", type=float, default=2.0,
+                    help="unconfirmed track: max time held out of view (s)")
     ap.add_argument("--view-near", type=float, default=0.7)
     ap.add_argument("--view-far", type=float, default=3.5)
-    ap.add_argument("--view-half-angle", type=float, default=25.0, help="only count a track as missed this far inside the view (deg)")
+    ap.add_argument("--view-half-angle", type=float, default=42.0,
+                    help="miss-count cone half-angle; tracks outside are kept until re-seen (deg)")
     ap.add_argument("--obstacle-range", type=float, default=4.0, help="track objects up to this far (m)")
     ap.add_argument("--m-per-count", type=float, default=0.0075)
     ap.add_argument("--dry-run", action="store_true")
